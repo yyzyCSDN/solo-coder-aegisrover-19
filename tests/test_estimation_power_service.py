@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from aegisrover.core.types import Pose2
 from aegisrover.estimation.filters import KalmanFilter, mahalanobis_squared
+from aegisrover.estimation.tracking import AMBIGUOUS, COASTING, LOST, TRACKING, HypothesisTracker
 from aegisrover.mission.execution import ExecutionError, Geofence, MissionExecution, WaypointRunner
 from aegisrover.power.charging import ChargingError, ChargingSession, DockAlignment, docking_error, is_aligned
 from aegisrover.power.energy import BatteryPack, DeratingCurve, budget, thermal_factor
@@ -295,3 +296,101 @@ def test_platform_api_endpoints():
     assert client.get('/v1/health').json()['status'] in ('ok', 'degraded')
     assert client.get('/v1/maps/nope').status_code == 404
     assert client.get('/live').json() == {'status': 'live'}
+
+
+# ------------------------------------------------------------------------------- tracking
+def test_tracker_converges_on_consistent_detections():
+    tracker = HypothesisTracker()
+    tracker.start((0.0, 0.0), time=0.0)
+    reports = [tracker.scan([(float(t), 0.0)], float(t)) for t in range(1, 6)]
+    assert reports[0].status == AMBIGUOUS  # a single hit is not confirmation
+    assert all(report.status == TRACKING for report in reports[1:])
+    final = reports[-1].best
+    assert math.dist(final.position, (5.0, 0.0)) < 0.3
+    assert abs(final.velocity[0] - 1.0) < 0.3
+    choice = tracker.explain_choice()
+    assert choice is not None and choice.hypothesis_id == final.hypothesis_id
+    assert choice.probability >= 0.6 and choice.reasons
+
+
+def test_tracker_does_not_jump_at_decoy_during_occlusion():
+    tracker = HypothesisTracker()
+    tracker.start((0.0, 0.0), time=0.0)
+    for t in range(1, 5):
+        tracker.scan([(float(t), 0.0)], float(t))
+    assert tracker.status == TRACKING
+    for t in range(5, 8):  # occluded — no detections at all
+        tracker.scan([], float(t))
+    assert tracker.status == COASTING
+    decoy = tracker.scan([(7.5, 1.5)], 8.0)  # tempting detection off the true path
+    assert decoy.status != TRACKING  # a single post-occlusion hit is not confirmation
+    reports = [tracker.scan([(float(t), 0.0)], float(t)) for t in range(9, 13)]
+    assert reports[-1].status == TRACKING
+    assert math.dist(reports[-1].best.position, (12.0, 0.0)) < 0.8
+    confirmed = [r.best.position for r in (decoy, *reports) if r.status == TRACKING]
+    assert all(math.dist(p, (7.5, 1.5)) > 0.5 for p in confirmed)
+
+
+def test_tracker_keeps_competing_hypotheses_until_evidence_arrives():
+    tracker = HypothesisTracker()
+    tracker.start((0.0, 0.0), time=0.0)
+    for t in range(1, 5):
+        tracker.scan([(float(t), 0.0)], float(t))
+    for t in range(5, 8):
+        tracker.scan([], float(t))
+    # the target reappears slightly off the predicted path while a decoy lands
+    # even closer to the prediction — a single-estimate tracker would grab it
+    ambiguous = tracker.scan([(8.6, -0.3), (8.1, 0.2)], 8.0)
+    assert ambiguous.status == AMBIGUOUS
+    assert tracker.hypothesis_count >= 2
+    assert ambiguous.probabilities[0][1] < 0.9  # no runaway winner yet
+    reports = [tracker.scan([(t + 0.6, -0.3)], float(t)) for t in range(9, 13)]
+    assert reports[-1].status == TRACKING
+    assert math.dist(reports[-1].best.position, (12.6, -0.3)) < 0.6
+    choice = tracker.explain_choice()
+    assert choice is not None and choice.reasons
+
+
+def test_tracker_declares_loss_and_explains_it():
+    tracker = HypothesisTracker(max_coast_scans=3)
+    tracker.start((0.0, 0.0), time=0.0)
+    for t in range(1, 4):
+        tracker.scan([(float(t), 0.0)], float(t))
+    assert tracker.status == TRACKING
+    reports = [tracker.scan([], float(t)) for t in range(4, 8)]
+    assert [r.status for r in reports] == [COASTING, COASTING, COASTING, LOST]
+    assert reports[-1].best is None and tracker.best_estimate() is None
+    lost = tracker.explain_lost()
+    assert lost is not None and lost.reason == 'coast_exceeded'
+    assert lost.scans_without_update == 4
+    assert lost.last_association is not None and lost.last_association.time == 3.0
+    assert lost.last_position is not None
+    assert 'consecutive scans' in lost.detail
+
+
+def test_tracker_reacquires_after_loss_without_jumping():
+    tracker = HypothesisTracker(max_coast_scans=3)
+    tracker.start((0.0, 0.0), time=0.0)
+    for t in range(1, 4):
+        tracker.scan([(float(t), 0.0)], float(t))
+    for t in range(4, 8):
+        tracker.scan([], float(t))
+    assert tracker.status == LOST
+    # the target reappears far from the dead track — outside any gate
+    first = tracker.scan([(20.0, 5.0)], 8.0)
+    assert first.status == AMBIGUOUS  # a candidate, not a conclusion
+    second = tracker.scan([(21.0, 5.0)], 9.0)
+    assert second.status == TRACKING
+    assert math.dist(second.best.position, (21.0, 5.0)) < 1.0
+    assert tracker.explain_lost() is None  # the loss is over, the choice is explained
+    assert tracker.explain_choice() is not None
+
+
+def test_tracker_rejects_non_increasing_time_and_bad_detections():
+    tracker = HypothesisTracker()
+    tracker.start((0.0, 0.0), time=1.0)
+    tracker.scan([(1.0, 0.0)], 2.0)
+    with pytest.raises(ValueError):
+        tracker.scan([(1.0, 0.0)], 2.0)
+    with pytest.raises(ValueError):
+        tracker.scan([(1.0, 0.0, 0.0)], 3.0)
